@@ -1,0 +1,65 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+
+dotenv.config();
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+app.post("/chat", async (req, res) => {
+  try {
+    const { message, userData } = req.body;
+
+    const userName = userData?.name || "uporabnik";
+    const userChallenges = userData?.challenges?.length
+      ? userData.challenges.join(", ")
+      : "ni navedeno";
+
+    const systemPrompt = `
+You are Selfly, a calm and supportive AI assistant for emotional wellbeing.
+Write in Slovenian.
+Be warm, gentle and practical.
+Do not diagnose.
+Do not claim to be a therapist or doctor.
+User name: ${userName}
+User challenges: ${userChallenges}
+`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.7,
+      max_tokens: 300,
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+        {
+          role: "user",
+          content: message,
+        },
+      ],
+    });
+
+    res.json({
+      reply: completion.choices[0].message.content,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      error: "Trenutno je prišlo do napake. Poskusi malo kasneje.",
+    });
+  }
+});
+
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
+});
