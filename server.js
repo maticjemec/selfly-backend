@@ -60,6 +60,54 @@ User challenges: ${userChallenges}
   }
 });
 
+app.post("/insight", async (req, res) => {
+  try {
+    const { conversation } = req.body;
+
+    if (!conversation || !conversation.trim()) {
+      return res.status(400).json({
+        error: "Manjka vsebina pogovora.",
+      });
+    }
+
+    const systemPrompt = `
+You are Selfly, an AI assistant for emotional wellbeing.
+Write in Slovenian.
+Your task is to extract one short, helpful emotional insight from the user's conversation.
+Do not diagnose.
+Do not claim to be a therapist or doctor.
+Be gentle, practical and clear.
+
+Return only one insight sentence.
+`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.5,
+      max_tokens: 150,
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+        {
+          role: "user",
+          content: conversation,
+        },
+      ],
+    });
+
+    res.json({
+      insight: completion.choices[0].message.content,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({
+      error: "Trenutno ni mogoče ustvariti vpogleda. Poskusi malo kasneje.",
+    });
+  }
+});
+
 app.listen(3000, () => {
   console.log("Server running on port 3000");
 });
