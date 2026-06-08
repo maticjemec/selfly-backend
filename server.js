@@ -108,6 +108,58 @@ Return only one insight sentence.
   }
 });
 
+app.post("/memory", async (req, res) => {
+  try {
+    const { conversation } = req.body;
+
+    if (!conversation || !conversation.trim()) {
+      return res.status(400).json({
+        error: "Manjka vsebina pogovora.",
+      });
+    }
+
+    const systemPrompt = `
+You are Selfly.
+Write in Slovenian.
+
+Your task is to extract ONE important long-term memory about the user.
+
+Examples:
+- User struggles with anxiety.
+- User wants to improve self-confidence.
+- User often feels overwhelmed at work.
+
+Return only one short memory sentence.
+`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.3,
+      max_tokens: 100,
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt,
+        },
+        {
+          role: "user",
+          content: conversation,
+        },
+      ],
+    });
+
+    res.json({
+      memory: completion.choices[0].message.content,
+    });
+  } catch (error) {
+    console.log(error);
+
+    res.status(500).json({
+      error: "Napaka pri ustvarjanju memory zapisa.",
+    });
+  }
+});
+
 app.listen(3000, () => {
   console.log("Server running on port 3000");
 });
