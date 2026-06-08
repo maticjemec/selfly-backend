@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
@@ -10,11 +11,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const aiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: {
+    error: "Preveč zahtev. Poskusi ponovno čez minuto."
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", aiLimiter, async (req, res) => {
   try {
     const { message, userData } = req.body;
 
@@ -60,7 +71,7 @@ User challenges: ${userChallenges}
   }
 });
 
-app.post("/insight", async (req, res) => {
+app.post("/insight", aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
@@ -108,7 +119,7 @@ Return only one insight sentence.
   }
 });
 
-app.post("/memory", async (req, res) => {
+app.post("/memory", aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
