@@ -15,19 +15,38 @@ const aiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
   message: {
-    error: "Preveč zahtev. Poskusi ponovno čez minuto."
+    success: false,
+    error: {
+      code: "RATE_LIMIT_EXCEEDED",
+      message: "Preveč zahtev. Poskusi ponovno čez minuto.",
+    },
   },
   standardHeaders: true,
   legacyHeaders: false,
 });
-
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+function errorResponse(res, status, code, message) {
+  return res.status(status).json({
+    success: false,
+    error: {
+      code,
+      message,
+    },
+  });
+}
+
 app.post("/chat", aiLimiter, async (req, res) => {
   try {
     const { message, userData } = req.body;
+    return errorResponse(
+  res,
+  500,
+  "AI_RESPONSE_FAILED",
+  "Trenutno je prišlo do napake. Poskusi malo kasneje."
+);
 
     const userName = userData?.name || "uporabnik";
     const userChallenges = userData?.challenges?.length
@@ -75,11 +94,7 @@ app.post("/insight", aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
-    if (!conversation || !conversation.trim()) {
-      return res.status(400).json({
-        error: "Manjka vsebina pogovora.",
-      });
-    }
+    return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
 
     const systemPrompt = `
 You are Selfly, an AI assistant for emotional wellbeing.
@@ -123,11 +138,7 @@ app.post("/memory", aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
-    if (!conversation || !conversation.trim()) {
-      return res.status(400).json({
-        error: "Manjka vsebina pogovora.",
-      });
-    }
+    return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
 
     const systemPrompt = `
 You are Selfly.
