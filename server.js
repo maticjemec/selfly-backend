@@ -43,12 +43,9 @@ function errorResponse(res, status, code, message) {
 app.post("/chat", aiLimiter, async (req, res) => {
   try {
     const { message, userData } = req.body;
-    return errorResponse(
-  res,
-  500,
-  "AI_RESPONSE_FAILED",
-  "Trenutno je prišlo do napake. Poskusi malo kasneje."
-);
+    if (!message || !message.trim()) {
+  return errorResponse(res, 400, "MISSING_MESSAGE", "Manjka sporočilo.");
+}
 
     const userName = userData?.name || "uporabnik";
     const userChallenges = userData?.challenges?.length
@@ -96,7 +93,9 @@ app.post("/insight", aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
-    return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
+    if (!conversation || !conversation.trim()) {
+  return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
+}
 
     const systemPrompt = `
 You are Selfly, an AI assistant for emotional wellbeing.
@@ -140,7 +139,9 @@ app.post("/memory", aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
-    return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
+    if (!conversation || !conversation.trim()) {
+  return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
+}
 
     const systemPrompt = `
 You are Selfly.
