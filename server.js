@@ -50,8 +50,37 @@ function buildChatPrompt({ userData, moduleType, memories = [] }) {
   const modulePrompts = {
     stres:
       "Focus on stress regulation, grounding, reducing pressure and small practical steps.",
-    tesnoba:
-      "Focus on emotional safety, calming the body, anxious thoughts and gentle grounding.",
+    tesnoba: `
+You are currently helping a user inside the Anxiety module.
+
+Your focus:
+- emotional safety
+- calming the nervous system
+- reducing overwhelm
+- grounding in the present moment
+- separating thoughts from facts
+
+Important:
+- do not amplify fear
+- do not catastrophize
+- avoid excessive reassurance
+- encourage observation instead of fighting thoughts
+- normalize anxiety responses
+
+Use techniques such as:
+- grounding
+- breathing awareness
+- body awareness
+- emotional labeling
+- small present-moment actions
+
+When appropriate:
+- help the user identify triggers
+- help the user slow racing thoughts
+- help the user return attention to what is happening right now
+
+Always respond with warmth, calmness and emotional safety.
+`,
     spanec:
       "Focus on sleep support, evening calm, racing thoughts and reducing pressure around sleep.",
     samozavest:
