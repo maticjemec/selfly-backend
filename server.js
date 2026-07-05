@@ -26,6 +26,7 @@ const aiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
@@ -40,27 +41,72 @@ function errorResponse(res, status, code, message) {
   });
 }
 
-app.post("/chat", aiLimiter, async (req, res) => {
-  try {
-    const { message, userData } = req.body;
-    if (!message || !message.trim()) {
-  return errorResponse(res, 400, "MISSING_MESSAGE", "Manjka sporočilo.");
+function buildChatPrompt({ userData, moduleType, memories = [] }) {
+  const userName = userData?.name || "uporabnik";
+  const userChallenges = userData?.challenges?.length
+    ? userData.challenges.join(", ")
+    : "ni navedeno";
+
+  const modulePrompts = {
+    stres:
+      "Focus on stress regulation, grounding, reducing pressure and small practical steps.",
+    tesnoba:
+      "Focus on emotional safety, calming the body, anxious thoughts and gentle grounding.",
+    spanec:
+      "Focus on sleep support, evening calm, racing thoughts and reducing pressure around sleep.",
+    samozavest:
+      "Focus on self-worth, inner confidence, self-trust and gentle encouragement.",
+    odnosi:
+      "Focus on relationships, boundaries, communication and emotional clarity.",
+    motivacija:
+      "Focus on motivation, small steps, energy, routine and realistic progress.",
+  };
+
+  const selectedModulePrompt =
+    modulePrompts[moduleType] || "Focus on general emotional wellbeing.";
+
+  const memoryText = Array.isArray(memories) && memories.length
+    ? memories.map((memory) => `- ${memory}`).join("\n")
+    : "No long-term memories yet.";
+
+  return `
+You are Selfly, a calm and supportive AI assistant for emotional wellbeing.
+
+Core rules:
+- Write in Slovenian.
+- Be warm, gentle and practical.
+- Use short, clear paragraphs.
+- Validate the user's emotion first.
+- Ask at most one reflective question.
+- Do not diagnose.
+- Do not claim to be a therapist or doctor.
+- Encourage one small realistic next step.
+
+User profile:
+- Name: ${userName}
+- Challenges: ${userChallenges}
+
+Active module:
+${selectedModulePrompt}
+
+Long-term memory:
+${memoryText}
+`;
 }
 
-    const userName = userData?.name || "uporabnik";
-    const userChallenges = userData?.challenges?.length
-      ? userData.challenges.join(", ")
-      : "ni navedeno";
+app.post("/chat", aiLimiter, async (req, res) => {
+  try {
+    const { message, userData, moduleType, memories } = req.body;
 
-    const systemPrompt = `
-You are Selfly, a calm and supportive AI assistant for emotional wellbeing.
-Write in Slovenian.
-Be warm, gentle and practical.
-Do not diagnose.
-Do not claim to be a therapist or doctor.
-User name: ${userName}
-User challenges: ${userChallenges}
-`;
+    if (!message || !message.trim()) {
+      return errorResponse(res, 400, "MISSING_MESSAGE", "Manjka sporočilo.");
+    }
+
+    const systemPrompt = buildChatPrompt({
+      userData,
+      moduleType,
+      memories,
+    });
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -94,8 +140,13 @@ app.post("/insight", aiLimiter, async (req, res) => {
     const { conversation } = req.body;
 
     if (!conversation || !conversation.trim()) {
-  return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
-}
+      return errorResponse(
+        res,
+        400,
+        "MISSING_CONVERSATION",
+        "Manjka vsebina pogovora."
+      );
+    }
 
     const systemPrompt = `
 You are Selfly, an AI assistant for emotional wellbeing.
@@ -140,8 +191,13 @@ app.post("/memory", aiLimiter, async (req, res) => {
     const { conversation } = req.body;
 
     if (!conversation || !conversation.trim()) {
-  return errorResponse(res, 400, "MISSING_CONVERSATION", "Manjka vsebina pogovora.");
-}
+      return errorResponse(
+        res,
+        400,
+        "MISSING_CONVERSATION",
+        "Manjka vsebina pogovora."
+      );
+    }
 
     const systemPrompt = `
 You are Selfly.
