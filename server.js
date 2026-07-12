@@ -417,6 +417,11 @@ app.post("/chat", aiLimiter, async (req, res) => {
     const crisisCheck = await detectCrisis(message);
 
 if (crisisCheck.detected) {
+  console.log("SAFETY EVENT", {
+  timestamp: new Date().toISOString(),
+  riskLevel: crisisCheck.riskLevel,
+  message: message.substring(0, 200),
+});
   const isHighRisk = crisisCheck.riskLevel === "high";
 
   return res.json({
