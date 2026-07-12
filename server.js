@@ -41,6 +41,60 @@ function errorResponse(res, status, code, message) {
   });
 }
 
+async function detectCrisis(message) {
+  const moderation = await openai.moderations.create({
+    model: "omni-moderation-latest",
+    input: message,
+  });
+
+  const result = moderation.results?.[0];
+
+  if (!result) {
+    return {
+      detected: false,
+      riskLevel: "none",
+      categories: {},
+    };
+  }
+
+  const categories = result.categories || {};
+  const scores = result.category_scores || {};
+
+  const hasIntent =
+    categories["self-harm/intent"] === true ||
+    scores["self-harm/intent"] >= 0.5;
+
+  const hasInstructions =
+    categories["self-harm/instructions"] === true ||
+    scores["self-harm/instructions"] >= 0.5;
+
+  const hasSelfHarm =
+    categories["self-harm"] === true ||
+    scores["self-harm"] >= 0.5;
+
+  if (hasIntent || hasInstructions) {
+    return {
+      detected: true,
+      riskLevel: "high",
+      categories,
+    };
+  }
+
+  if (hasSelfHarm) {
+    return {
+      detected: true,
+      riskLevel: "concern",
+      categories,
+    };
+  }
+
+  return {
+    detected: false,
+    riskLevel: "none",
+    categories,
+  };
+}
+
 function buildChatPrompt({ userData, moduleType, memories = [] }) {
   const userName = userData?.name || "uporabnik";
   const userChallenges = userData?.challenges?.length
@@ -344,6 +398,38 @@ app.post("/chat", aiLimiter, async (req, res) => {
     if (!message || !message.trim()) {
       return errorResponse(res, 400, "MISSING_MESSAGE", "Manjka sporočilo.");
     }
+
+    const crisisCheck = await detectCrisis(message);
+
+if (crisisCheck.detected) {
+  const isHighRisk = crisisCheck.riskLevel === "high";
+
+  return res.json({
+    crisis: true,
+    riskLevel: crisisCheck.riskLevel,
+    reply: isHighRisk
+      ? `
+Sliši se, da si trenutno v zelo hudi stiski. Pomembno je, da v tem trenutku ne ostaneš sam/a.
+
+Če si v neposredni nevarnosti ali misliš, da bi si lahko kaj naredil/a, takoj pokliči 112 ali pojdi na najbližjo urgenco.
+
+Pokličeš lahko tudi Zaupni telefon Samarijan na 116 123, ki je na voljo ves čas.
+
+Prosim, stopi zdaj v stik tudi z osebo, ki ji zaupaš, in ji jasno povej, da potrebuješ pomoč.
+
+Ali si trenutno v neposredni nevarnosti?
+`.trim()
+      : `
+Sliši se, da ti je trenutno zelo težko in da te te misli močno obremenjujejo.
+
+Pomembno je, da tega ne nosiš sam/a. Poskusi še danes stopiti v stik z osebo, ki ji zaupaš, ali s strokovnjakom.
+
+Pokličeš lahko tudi Zaupni telefon Samarijan na 116 123.
+
+Ali imaš trenutno misli ali namen, da bi si kaj naredil/a?
+`.trim(),
+  });
+}
 
     const systemPrompt = buildChatPrompt({
       userData,
