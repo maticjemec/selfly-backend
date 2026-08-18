@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import rateLimit from "express-rate-limit";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -31,6 +32,53 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+async function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return errorResponse(
+      res,
+      401,
+      "UNAUTHORIZED",
+      "Manjka veljavna avtentikacija."
+    );
+  }
+
+  const token = authHeader.slice(7).trim();
+
+  if (!token) {
+    return errorResponse(
+      res,
+      401,
+      "UNAUTHORIZED",
+      "Manjka veljavna avtentikacija."
+    );
+  }
+
+  const {
+    data: { user },
+    error,
+  } = await supabase.auth.getUser(token);
+
+  if (error || !user) {
+    return errorResponse(
+      res,
+      401,
+      "UNAUTHORIZED",
+      "Manjka veljavna avtentikacija."
+    );
+  }
+
+  req.user = { id: user.id };
+  req.accessToken = token;
+  next();
+}
+
 function errorResponse(res, status, code, message) {
   return res.status(status).json({
     success: false,
@@ -39,6 +87,248 @@ function errorResponse(res, status, code, message) {
       message,
     },
   });
+}
+
+const VALID_MODULE_TYPES = new Set([
+  "general",
+  "stres",
+  "tesnoba",
+  "spanec",
+  "samozavest",
+  "odnosi",
+  "motivacija",
+]);
+
+const MAX_HISTORY_MESSAGES = 20;
+
+function isValidUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    value
+  );
+}
+
+function createUserSupabaseClient(accessToken) {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    },
+  });
+}
+
+function normalizeChallenges(value) {
+  if (Array.isArray(value)) {
+    return value.filter((item) => typeof item === "string");
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    return [value];
+  }
+
+  return [];
+}
+
+async function loadChatContext({ accessToken, conversationId, message }) {
+  const userClient = createUserSupabaseClient(accessToken);
+  const trimmedMessage = message.trim();
+
+  const { data: profile, error: profileError } = await userClient
+    .from("profiles")
+    .select("nickname, age, gender, challenges")
+    .maybeSingle();
+
+  if (profileError) {
+    throw profileError;
+  }
+
+  let moduleType = "general";
+  let history = [];
+
+  if (conversationId) {
+    if (!isValidUuid(conversationId)) {
+      return {
+        error: {
+          status: 400,
+          code: "INVALID_CONVERSATION_ID",
+          message: "Neveljaven ID pogovora.",
+        },
+      };
+    }
+
+    const { data: conversation, error: conversationError } = await userClient
+      .from("conversations")
+      .select("id, module_type")
+      .eq("id", conversationId)
+      .maybeSingle();
+
+    if (conversationError) {
+      throw conversationError;
+    }
+
+    if (!conversation) {
+      return {
+        error: {
+          status: 404,
+          code: "CONVERSATION_NOT_FOUND",
+          message: "Pogovor ni bil najden.",
+        },
+      };
+    }
+
+    if (
+      conversation.module_type &&
+      VALID_MODULE_TYPES.has(conversation.module_type)
+    ) {
+      moduleType = conversation.module_type;
+    }
+
+    const { data: messageRows, error: messagesError } = await userClient
+      .from("messages")
+      .select("role, text, created_at")
+      .eq("conversation_id", conversationId)
+      .order("created_at", { ascending: true });
+
+    if (messagesError) {
+      throw messagesError;
+    }
+
+    let validMessages = (messageRows || [])
+      .filter((row) => row.role === "user" || row.role === "assistant")
+      .map((row) => ({
+        role: row.role,
+        content: row.text,
+      }));
+
+    const lastMessage = validMessages[validMessages.length - 1];
+
+    if (
+      lastMessage?.role === "user" &&
+      lastMessage.content.trim() === trimmedMessage
+    ) {
+      validMessages = validMessages.slice(0, -1);
+    }
+
+    history = validMessages.slice(-MAX_HISTORY_MESSAGES);
+  }
+
+  const { data: moodEntries, error: moodError } = await userClient
+    .from("mood_entries")
+    .select("mood")
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (moodError) {
+    throw moodError;
+  }
+
+  const { data: memoryRows, error: memoryError } = await userClient
+    .from("user_memory")
+    .select("content")
+    .eq("active", true)
+    .order("importance_score", { ascending: false })
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (memoryError) {
+    throw memoryError;
+  }
+
+  const userData = {
+    name: profile?.nickname || "uporabnik",
+    age: profile?.age || null,
+    gender: profile?.gender || null,
+    challenges: normalizeChallenges(profile?.challenges),
+    latestMood: moodEntries?.[0]?.mood ?? null,
+  };
+
+  const memories = (memoryRows || [])
+    .map((row) => row.content)
+    .filter((content) => typeof content === "string" && content.trim());
+
+  return {
+    userData,
+    moduleType,
+    memories,
+    history,
+  };
+}
+
+const MIN_INSIGHT_USER_MESSAGES = 2;
+const MAX_INSIGHT_USER_MESSAGES = 20;
+
+async function loadInsightContext({ accessToken, conversationId }) {
+  if (!conversationId || !String(conversationId).trim()) {
+    return {
+      error: {
+        status: 400,
+        code: "MISSING_CONVERSATION_ID",
+        message: "Manjka ID pogovora.",
+      },
+    };
+  }
+
+  if (!isValidUuid(conversationId)) {
+    return {
+      error: {
+        status: 400,
+        code: "INVALID_CONVERSATION_ID",
+        message: "Neveljaven ID pogovora.",
+      },
+    };
+  }
+
+  const userClient = createUserSupabaseClient(accessToken);
+
+  const { data: conversation, error: conversationError } = await userClient
+    .from("conversations")
+    .select("id")
+    .eq("id", conversationId)
+    .maybeSingle();
+
+  if (conversationError) {
+    throw conversationError;
+  }
+
+  if (!conversation) {
+    return {
+      error: {
+        status: 404,
+        code: "CONVERSATION_NOT_FOUND",
+        message: "Pogovor ni bil najden.",
+      },
+    };
+  }
+
+  const { data: messageRows, error: messagesError } = await userClient
+    .from("messages")
+    .select("role, text, created_at")
+    .eq("conversation_id", conversationId)
+    .order("created_at", { ascending: true });
+
+  if (messagesError) {
+    throw messagesError;
+  }
+
+  const userMessages = (messageRows || [])
+    .filter((row) => row.role === "user")
+    .map((row) => row.text.trim())
+    .filter(Boolean)
+    .slice(-MAX_INSIGHT_USER_MESSAGES);
+
+  if (userMessages.length < MIN_INSIGHT_USER_MESSAGES) {
+    return {
+      skipped: true,
+      userMessages,
+    };
+  }
+
+  const conversationText = userMessages.map((text) => `- ${text}`).join("\n");
+
+  return {
+    skipped: false,
+    conversationText,
+  };
 }
 
 async function detectCrisis(message) {
@@ -95,11 +385,145 @@ async function detectCrisis(message) {
   };
 }
 
+
+async function extractMemory(userMessage) {
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    temperature: 0,
+    max_tokens: 100,
+    messages: [
+      {
+        role: "system",
+        content: `
+You extract useful long-term memories about a user from their message.
+
+Write the result in Slovenian.
+
+Save only information that may be useful in future conversations, such as:
+- important goals
+- recurring fears or emotional patterns
+- important relationships
+- long-term life circumstances
+- personal preferences
+- values
+- important responsibilities
+- recurring challenges
+
+Do not save:
+- greetings
+- temporary moods without wider meaning
+- small daily events
+- assistant responses
+- vague or generic statements
+- crisis or self-harm content
+- medical diagnoses or assumptions
+
+Return ONLY valid JSON.
+
+If no useful memory exists:
+
+{
+  "memory": null,
+  "importanceScore": 0,
+  "category": null
+}
+
+Otherwise:
+
+{
+  "memory": "...",
+  "importanceScore": 1,
+  "category": "..."
+}
+
+Allowed categories:
+
+general
+tesnoba
+stres
+samozavest
+odnosi
+motivacija
+spanec
+cilji
+delo
+družina
+partner
+zdravje
+
+Importance rules:
+
+1 = preference
+2 = useful fact
+3 = recurring challenge
+4 = important life situation
+5 = core long-term pattern
+
+If no useful memory exists:
+
+{
+  "memory": null,
+  "importanceScore": 0
+}
+
+Otherwise:
+
+{
+  "memory": "...",
+  "importanceScore": 1
+}
+
+Importance rules:
+
+1 = preference
+2 = useful fact
+3 = recurring challenge
+4 = important life situation
+5 = core long-term pattern
+
+Do not add explanations.
+`,
+      },
+      {
+        role: "user",
+        content: userMessage,
+      },
+    ],
+  });
+
+  const result = completion.choices[0].message.content || "{}";
+
+try {
+    const parsed = JSON.parse(result);
+
+    return {
+    memory: parsed.memory,
+    importanceScore: parsed.importanceScore ?? 1,
+    category: parsed.category ?? "general",
+};
+
+} catch {
+return {
+    memory: null,
+    importanceScore: 0,
+    category: null,
+};
+    return {
+        memory: null,
+        importanceScore: 0,
+    };
+
+}
+}
+
 function buildChatPrompt({ userData, moduleType, memories = [] }) {
+
+ 
   const userName = userData?.name || "uporabnik";
   const userChallenges = userData?.challenges?.length
     ? userData.challenges.join(", ")
     : "ni navedeno";
+  const latestMood = userData?.latestMood || "ni navedeno";
 
   const modulePrompts = {
     general: `
@@ -397,6 +821,7 @@ Safety rules:
 User profile:
 - Name: ${userName}
 - Challenges: ${userChallenges}
+- Latest mood: ${latestMood}
 
 Active module:
 ${selectedModulePrompt}
@@ -406,28 +831,33 @@ ${memoryText}
 `;
 }
 
-app.post("/chat", aiLimiter, async (req, res) => {
+app.post("/chat", requireAuth, aiLimiter, async (req, res) => {
   try {
-    const { message, userData, moduleType, memories } = req.body;
+    const { message, conversationId } = req.body;
 
     if (!message || !message.trim()) {
       return errorResponse(res, 400, "MISSING_MESSAGE", "Manjka sporočilo.");
     }
 
-    const crisisCheck = await detectCrisis(message);
+    const trimmedMessage = message.trim();
+
+    const crisisCheck = await detectCrisis(trimmedMessage);
 
 if (crisisCheck.detected) {
   console.log("SAFETY EVENT", {
   timestamp: new Date().toISOString(),
   riskLevel: crisisCheck.riskLevel,
-  message: message.substring(0, 200),
+  message: trimmedMessage.substring(0, 200),
 });
   const isHighRisk = crisisCheck.riskLevel === "high";
 
   return res.json({
     crisis: true,
     riskLevel: crisisCheck.riskLevel,
+    showTherapistCTA: !isHighRisk,
+extractedMemory: null,
     reply: isHighRisk
+    
       ? `
 Sliši se, da si trenutno v zelo hudi stiski. Pomembno je, da v tem trenutku ne ostaneš sam/a.
 
@@ -451,6 +881,19 @@ Ali imaš trenutno misli ali namen, da bi si kaj naredil/a?
   });
 }
 
+    const contextResult = await loadChatContext({
+      accessToken: req.accessToken,
+      conversationId,
+      message: trimmedMessage,
+    });
+
+    if (contextResult.error) {
+      const { status, code, message: errorMessage } = contextResult.error;
+      return errorResponse(res, status, code, errorMessage);
+    }
+
+    const { userData, moduleType, memories, history } = contextResult;
+
     const systemPrompt = buildChatPrompt({
       userData,
       moduleType,
@@ -466,16 +909,29 @@ Ali imaš trenutno misli ali namen, da bi si kaj naredil/a?
           role: "system",
           content: systemPrompt,
         },
+        ...history,
         {
           role: "user",
-          content: message,
+          content: trimmedMessage,
         },
       ],
     });
 
-    res.json({
-      reply: completion.choices[0].message.content,
-    });
+    const aiReply = completion.choices[0].message.content || "";
+
+const extractedMemory = await extractMemory(trimmedMessage);
+
+res.json({
+    crisis: false,
+    riskLevel: "none",
+    showTherapistCTA: false,
+
+    reply: aiReply,
+
+    extractedMemory: extractedMemory.memory,
+    importanceScore: extractedMemory.importanceScore,
+    category: extractedMemory.category,
+});
   } catch (error) {
     console.log(error);
     res.status(500).json({
@@ -484,17 +940,25 @@ Ali imaš trenutno misli ali namen, da bi si kaj naredil/a?
   }
 });
 
-app.post("/insight", aiLimiter, async (req, res) => {
+app.post("/insight", requireAuth, aiLimiter, async (req, res) => {
   try {
-    const { conversation } = req.body;
+    const { conversationId } = req.body;
 
-    if (!conversation || !conversation.trim()) {
-      return errorResponse(
-        res,
-        400,
-        "MISSING_CONVERSATION",
-        "Manjka vsebina pogovora."
-      );
+    const contextResult = await loadInsightContext({
+      accessToken: req.accessToken,
+      conversationId,
+    });
+
+    if (contextResult.error) {
+      const { status, code, message } = contextResult.error;
+      return errorResponse(res, status, code, message);
+    }
+
+    if (contextResult.skipped) {
+      return res.json({
+        insight: null,
+        skipped: true,
+      });
     }
 
     const systemPrompt = `
@@ -519,23 +983,35 @@ Return only one insight sentence.
         },
         {
           role: "user",
-          content: conversation,
+          content: contextResult.conversationText,
         },
       ],
     });
 
+    const insight = completion.choices[0].message.content?.trim() || null;
+
+    if (!insight) {
+      return res.json({
+        insight: null,
+        skipped: true,
+      });
+    }
+
     res.json({
-      insight: completion.choices[0].message.content,
+      insight,
     });
   } catch (error) {
     console.log(error);
-    res.status(500).json({
-      error: "Trenutno ni mogoče ustvariti vpogleda. Poskusi malo kasneje.",
-    });
+    return errorResponse(
+      res,
+      500,
+      "INSIGHT_GENERATION_FAILED",
+      "Trenutno ni mogoče ustvariti vpogleda. Poskusi malo kasneje."
+    );
   }
 });
 
-app.post("/memory", aiLimiter, async (req, res) => {
+app.post("/memory", requireAuth, aiLimiter, async (req, res) => {
   try {
     const { conversation } = req.body;
 
