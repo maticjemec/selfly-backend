@@ -13,6 +13,8 @@ import {
   prepareAnalysisMessages,
   validateMapSuggestions,
 } from "./mapSuggestions.js";
+import { isValidUuid, validateMapSuggestionRequest } from "./requestValidation.js";
+import { createTtlCache } from "./ttlCache.js";
 
 dotenv.config();
 
@@ -109,12 +111,6 @@ const VALID_MODULE_TYPES = new Set([
 ]);
 
 const MAX_HISTORY_MESSAGES = 20;
-
-function isValidUuid(value) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    value
-  );
-}
 
 function createUserSupabaseClient(accessToken) {
   return createClient(process.env.VITE_SUPABASE_URL, process.env.VITE_SUPABASE_ANON_KEY, {
@@ -1077,14 +1073,8 @@ Return only one short memory sentence.
 });
 
 const MAP_CACHE_LIMIT = 500;
-const mapSuggestionCache = new Map();
-
-function rememberMapSuggestions(cacheKey, insightIds) {
-  if (mapSuggestionCache.size >= MAP_CACHE_LIMIT) {
-    mapSuggestionCache.delete(mapSuggestionCache.keys().next().value);
-  }
-  mapSuggestionCache.set(cacheKey, insightIds);
-}
+const MAP_INVALID_RETRY_MS = 10 * 60 * 1000;
+const mapSuggestionCache = createTtlCache({ limit: MAP_CACHE_LIMIT });
 
 function toMapSuggestion(row) {
   return {
@@ -1096,26 +1086,6 @@ function toMapSuggestion(row) {
 }
 
 async function loadMapSuggestionContext({ accessToken, conversationId }) {
-  if (!conversationId || !String(conversationId).trim()) {
-    return {
-      error: {
-        status: 400,
-        code: "MISSING_CONVERSATION_ID",
-        message: "Manjka ID pogovora.",
-      },
-    };
-  }
-
-  if (!isValidUuid(conversationId)) {
-    return {
-      error: {
-        status: 400,
-        code: "INVALID_CONVERSATION_ID",
-        message: "Neveljaven ID pogovora.",
-      },
-    };
-  }
-
   const userClient = createUserSupabaseClient(accessToken);
 
   const { data: conversation, error: conversationError } = await userClient
@@ -1140,7 +1110,7 @@ async function loadMapSuggestionContext({ accessToken, conversationId }) {
 
   const { data: messageRows, error: messagesError } = await userClient
     .from("messages")
-    .select("id, role, text")
+    .select("id, role, text, created_at")
     .eq("conversation_id", conversationId)
     .eq("role", "user")
     .order("created_at", { ascending: false })
@@ -1202,7 +1172,12 @@ async function loadSuggestionsByIds(userClient, insightIds) {
 
 app.post("/map-suggestions", requireAuth, aiLimiter, async (req, res) => {
   try {
-    const { conversationId } = req.body;
+    const request = validateMapSuggestionRequest(req.body);
+    if (request.error) {
+      const { status, code, message } = request.error;
+      return errorResponse(res, status, code, message);
+    }
+    const { conversationId } = request;
 
     const context = await loadMapSuggestionContext({
       accessToken: req.accessToken,
@@ -1219,10 +1194,14 @@ app.post("/map-suggestions", requireAuth, aiLimiter, async (req, res) => {
     }
 
     const cacheKey = `${req.user.id}:${conversationId}:${context.latestUserMessageId}`;
-    const cachedIds = mapSuggestionCache.get(cacheKey);
+    const cached = mapSuggestionCache.get(cacheKey);
 
-    if (cachedIds) {
-      const suggestions = await loadSuggestionsByIds(context.userClient, cachedIds);
+    if (cached?.kind === "invalid") {
+      return res.json({ suggestions: [] });
+    }
+
+    if (cached?.kind === "ok") {
+      const suggestions = await loadSuggestionsByIds(context.userClient, cached.insightIds);
       return res.json({ suggestions });
     }
 
@@ -1266,6 +1245,7 @@ app.post("/map-suggestions", requireAuth, aiLimiter, async (req, res) => {
     );
 
     if (!rawSuggestions) {
+      mapSuggestionCache.set(cacheKey, { kind: "invalid" }, MAP_INVALID_RETRY_MS);
       return res.json({ suggestions: [] });
     }
 
@@ -1302,10 +1282,10 @@ app.post("/map-suggestions", requireAuth, aiLimiter, async (req, res) => {
       saved.push(toMapSuggestion(data));
     }
 
-    rememberMapSuggestions(
-      cacheKey,
-      saved.map((suggestion) => suggestion.id)
-    );
+    mapSuggestionCache.set(cacheKey, {
+      kind: "ok",
+      insightIds: saved.map((suggestion) => suggestion.id),
+    });
 
     res.json({ suggestions: saved });
   } catch (error) {

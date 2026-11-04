@@ -7,7 +7,7 @@ export const MAX_MESSAGE_CHARS = 500;
 export const MAX_ANALYSIS_CHARS = 6000;
 export const MIN_MESSAGE_CHARS = 8;
 export const MIN_MEANINGFUL_MESSAGES = 2;
-export const MIN_PATTERN_EVIDENCE = 2;
+export const MIN_PATTERN_OCCASIONS = 2;
 export const MAX_SUGGESTIONS = 3;
 export const MAX_SUGGESTION_CHARS = 200;
 export const MAX_EXISTING_ITEMS_IN_PROMPT = 50;
@@ -54,6 +54,7 @@ export function prepareAnalysisMessages(rows) {
     .map((row) => ({
       id: row.id,
       text: row.text.trim().slice(0, MAX_MESSAGE_CHARS),
+      createdAt: row.created_at,
     }))
     .filter((row) => row.text.length > 0);
 
@@ -121,9 +122,9 @@ Write every "text" in Slovenian, as one short, tentative sentence (for example "
 
 Kinds:
 - trigger: a situation or thought that the user said precedes unpleasant feelings.
-- pattern: a repeated response or behavior. Only use "pattern" if the evidence shows the same
-  response in at least ${MIN_PATTERN_EVIDENCE} separate messages describing separate occasions.
-  One event is never a pattern.
+- pattern: a repeated response or behavior. Use "pattern" only when the same response appears
+  in at least ${MIN_PATTERN_OCCASIONS} messages that describe separate occasions on different days.
+  One event described in several messages is never a pattern. If you cannot tell clearly, do not use "pattern".
 - strength: a resource, skill or approach the user said helps them.
 
 Strict rules:
@@ -141,6 +142,18 @@ Return only JSON matching the schema.
 `;
 }
 
+function isWellFormedSuggestion(item) {
+  return (
+    item !== null &&
+    typeof item === "object" &&
+    !Array.isArray(item) &&
+    MAP_KINDS.includes(item.kind) &&
+    typeof item.text === "string" &&
+    Array.isArray(item.evidence_message_ids) &&
+    item.evidence_message_ids.every((id) => typeof id === "string")
+  );
+}
+
 export function parseMapSuggestionsResponse(content) {
   if (typeof content !== "string") return null;
   let parsed;
@@ -149,39 +162,56 @@ export function parseMapSuggestionsResponse(content) {
   } catch {
     return null;
   }
-  if (!parsed || !Array.isArray(parsed.suggestions)) return null;
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.suggestions)) {
+    return null;
+  }
+  if (parsed.suggestions.length > MAX_SUGGESTIONS) return null;
+  if (!parsed.suggestions.every(isWellFormedSuggestion)) return null;
   return parsed.suggestions;
 }
 
-function isEvidenceValid(ids, allowedIds) {
+function isEvidenceValid(ids, messagesById) {
   if (!Array.isArray(ids) || ids.length === 0) return false;
-  const unique = new Set(ids);
-  if (unique.size !== ids.length) return false;
-  return ids.every((id) => typeof id === "string" && allowedIds.has(id));
+  if (new Set(ids).size !== ids.length) return false;
+  return ids.every((id) => typeof id === "string" && messagesById.has(id));
+}
+
+function dayKey(createdAt) {
+  const time = Date.parse(createdAt);
+  if (Number.isNaN(time)) return null;
+  return new Date(time).toISOString().slice(0, 10);
+}
+
+function countOccasions(ids, messagesById) {
+  const days = new Set(ids.map((id) => dayKey(messagesById.get(id).createdAt)));
+  days.delete(null);
+  return days.size;
 }
 
 export function validateMapSuggestions(rawSuggestions, { messages, existingItems }) {
-  const allowedIds = new Map(messages.map((message) => [message.id, message.text]));
+  const messagesById = new Map(messages.map((message) => [message.id, message]));
   const existingKeys = new Set(existingItems.map((item) => item.dedupeKey).filter(Boolean));
   const existingTexts = existingItems.map((item) => item.text);
   const accepted = [];
 
   for (const raw of rawSuggestions) {
     if (accepted.length >= MAX_SUGGESTIONS) break;
-    if (!raw || typeof raw !== "object") continue;
 
     const kind = raw.kind;
-    const text = typeof raw.text === "string" ? raw.text.trim() : "";
+    const text = raw.text.trim();
     const evidence = raw.evidence_message_ids;
 
     if (!MAP_KINDS.includes(kind)) continue;
     if (!text || text.length > MAX_SUGGESTION_CHARS) continue;
     if (containsDiagnosticLanguage(text)) continue;
-    if (!isEvidenceValid(evidence, allowedIds)) continue;
-    if (kind === "pattern" && evidence.length < MIN_PATTERN_EVIDENCE) continue;
+    if (!isEvidenceValid(evidence, messagesById)) continue;
 
-    const evidenceTexts = evidence.map((id) => allowedIds.get(id));
-    if (evidenceTexts.some((value) => value.length < MIN_MESSAGE_CHARS)) continue;
+    const evidenceMessages = evidence.map((id) => messagesById.get(id));
+    if (evidenceMessages.some((message) => message.text.length < MIN_MESSAGE_CHARS)) continue;
+
+    if (kind === "pattern" && countOccasions(evidence, messagesById) < MIN_PATTERN_OCCASIONS) {
+      continue;
+    }
 
     const dedupeKey = buildDedupeKey(kind, text);
     if (existingKeys.has(dedupeKey)) continue;
