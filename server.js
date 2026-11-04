@@ -4,6 +4,15 @@ import dotenv from "dotenv";
 import OpenAI from "openai";
 import rateLimit from "express-rate-limit";
 import { createClient } from "@supabase/supabase-js";
+import {
+  MAX_ANALYSIS_MESSAGES,
+  MAP_SUGGESTIONS_RESPONSE_FORMAT,
+  buildMapSuggestionsPrompt,
+  hasEnoughEvidence,
+  parseMapSuggestionsResponse,
+  prepareAnalysisMessages,
+  validateMapSuggestions,
+} from "./mapSuggestions.js";
 
 dotenv.config();
 
@@ -1064,6 +1073,249 @@ Return only one short memory sentence.
     res.status(500).json({
       error: "Napaka pri ustvarjanju memory zapisa.",
     });
+  }
+});
+
+const MAP_CACHE_LIMIT = 500;
+const mapSuggestionCache = new Map();
+
+function rememberMapSuggestions(cacheKey, insightIds) {
+  if (mapSuggestionCache.size >= MAP_CACHE_LIMIT) {
+    mapSuggestionCache.delete(mapSuggestionCache.keys().next().value);
+  }
+  mapSuggestionCache.set(cacheKey, insightIds);
+}
+
+function toMapSuggestion(row) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    text: row.insight,
+    evidenceMessageIds: row.evidence_message_ids ?? [],
+  };
+}
+
+async function loadMapSuggestionContext({ accessToken, conversationId }) {
+  if (!conversationId || !String(conversationId).trim()) {
+    return {
+      error: {
+        status: 400,
+        code: "MISSING_CONVERSATION_ID",
+        message: "Manjka ID pogovora.",
+      },
+    };
+  }
+
+  if (!isValidUuid(conversationId)) {
+    return {
+      error: {
+        status: 400,
+        code: "INVALID_CONVERSATION_ID",
+        message: "Neveljaven ID pogovora.",
+      },
+    };
+  }
+
+  const userClient = createUserSupabaseClient(accessToken);
+
+  const { data: conversation, error: conversationError } = await userClient
+    .from("conversations")
+    .select("id")
+    .eq("id", conversationId)
+    .maybeSingle();
+
+  if (conversationError) {
+    throw conversationError;
+  }
+
+  if (!conversation) {
+    return {
+      error: {
+        status: 404,
+        code: "CONVERSATION_NOT_FOUND",
+        message: "Pogovor ni bil najden.",
+      },
+    };
+  }
+
+  const { data: messageRows, error: messagesError } = await userClient
+    .from("messages")
+    .select("id, role, text")
+    .eq("conversation_id", conversationId)
+    .eq("role", "user")
+    .order("created_at", { ascending: false })
+    .limit(MAX_ANALYSIS_MESSAGES);
+
+  if (messagesError) {
+    throw messagesError;
+  }
+
+  const newestFirst = messageRows || [];
+  const messages = prepareAnalysisMessages([...newestFirst].reverse());
+
+  if (!hasEnoughEvidence(messages)) {
+    return { skipped: true };
+  }
+
+  const { data: existingRows, error: existingError } = await userClient
+    .from("insights")
+    .select("kind, insight, status, dedupe_key")
+    .order("created_at", { ascending: false })
+    .limit(200);
+
+  if (existingError) {
+    throw existingError;
+  }
+
+  const existingItems = (existingRows || []).map((row) => ({
+    kind: row.kind,
+    text: row.insight,
+    status: row.status,
+    dedupeKey: row.dedupe_key,
+  }));
+
+  return {
+    userClient,
+    messages,
+    existingItems,
+    latestUserMessageId: newestFirst[0].id,
+  };
+}
+
+async function loadSuggestionsByIds(userClient, insightIds) {
+  if (insightIds.length === 0) {
+    return [];
+  }
+
+  const { data, error } = await userClient
+    .from("insights")
+    .select("id, kind, insight, evidence_message_ids")
+    .in("id", insightIds)
+    .eq("status", "suggested");
+
+  if (error) {
+    throw error;
+  }
+
+  return (data || []).map(toMapSuggestion);
+}
+
+app.post("/map-suggestions", requireAuth, aiLimiter, async (req, res) => {
+  try {
+    const { conversationId } = req.body;
+
+    const context = await loadMapSuggestionContext({
+      accessToken: req.accessToken,
+      conversationId,
+    });
+
+    if (context.error) {
+      const { status, code, message } = context.error;
+      return errorResponse(res, status, code, message);
+    }
+
+    if (context.skipped) {
+      return res.json({ suggestions: [], skipped: true });
+    }
+
+    const cacheKey = `${req.user.id}:${conversationId}:${context.latestUserMessageId}`;
+    const cachedIds = mapSuggestionCache.get(cacheKey);
+
+    if (cachedIds) {
+      const suggestions = await loadSuggestionsByIds(context.userClient, cachedIds);
+      return res.json({ suggestions });
+    }
+
+    const crisisCheck = await detectCrisis(
+      context.messages.map((message) => message.text).join("\n")
+    );
+
+    if (crisisCheck.detected) {
+      return res.json({
+        suggestions: [],
+        skipped: true,
+        crisis: true,
+        riskLevel: crisisCheck.riskLevel,
+      });
+    }
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      max_tokens: 500,
+      response_format: {
+        type: "json_schema",
+        json_schema: MAP_SUGGESTIONS_RESPONSE_FORMAT,
+      },
+      messages: [
+        {
+          role: "system",
+          content: buildMapSuggestionsPrompt(context.existingItems),
+        },
+        {
+          role: "user",
+          content: context.messages
+            .map((message) => `[${message.id}] ${message.text}`)
+            .join("\n"),
+        },
+      ],
+    });
+
+    const rawSuggestions = parseMapSuggestionsResponse(
+      completion.choices[0]?.message?.content
+    );
+
+    if (!rawSuggestions) {
+      return res.json({ suggestions: [] });
+    }
+
+    const accepted = validateMapSuggestions(rawSuggestions, {
+      messages: context.messages,
+      existingItems: context.existingItems,
+    });
+
+    const saved = [];
+
+    for (const suggestion of accepted) {
+      const { data, error } = await context.userClient
+        .from("insights")
+        .insert({
+          user_id: req.user.id,
+          conversation_id: conversationId,
+          insight: suggestion.text,
+          kind: suggestion.kind,
+          status: "suggested",
+          source_type: "map_suggestion",
+          evidence_message_ids: suggestion.evidenceMessageIds,
+          dedupe_key: suggestion.dedupeKey,
+        })
+        .select("id, kind, insight, evidence_message_ids")
+        .single();
+
+      if (error) {
+        if (error.code === "23505") {
+          continue;
+        }
+        throw error;
+      }
+
+      saved.push(toMapSuggestion(data));
+    }
+
+    rememberMapSuggestions(
+      cacheKey,
+      saved.map((suggestion) => suggestion.id)
+    );
+
+    res.json({ suggestions: saved });
+  } catch (error) {
+    console.log("map-suggestions failed", error?.code ?? error?.message ?? "unknown");
+    return errorResponse(
+      res,
+      500,
+      "MAP_SUGGESTIONS_FAILED",
+      "Trenutno ni mogoče ustvariti predlogov. Poskusi malo kasneje."
+    );
   }
 });
 
