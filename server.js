@@ -226,6 +226,7 @@ async function loadChatContext({ accessToken, conversationId, message }) {
     .from("user_memory")
     .select("content")
     .eq("active", true)
+    .eq("memory_type", "confirmed")
     .order("importance_score", { ascending: false })
     .order("created_at", { ascending: false })
     .limit(10);
